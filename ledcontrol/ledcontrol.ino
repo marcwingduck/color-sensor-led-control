@@ -56,7 +56,7 @@ void setup()
 
     // sweep to default color
     applyColorRGB(off);
-    sweepToHSV(3 * 360 + 330, 0.9, 0.3);
+    sweepToHSV(360 + 256, 0.0, 0.1);
 }
 
 void loop()
@@ -125,7 +125,7 @@ void sweepToHSV(int hue, double sat, double val)
         v = interp(1., val, t);
         chosenColor = hsv1_to_rgb255(h, s, v);
         applyColorRGB(chosenColor);
-        delay(interp(5, 20, t * t));
+        delay(interp(16, 4, t * t));
     }
 
     hsvSpace[0] = h * (hsvRange[0] - 1);
