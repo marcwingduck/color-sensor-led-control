@@ -1,7 +1,49 @@
-const int pinGreen = 9;
-const int pinRed = 10;
-const int pinBlue = 11;
+/**
+ * Single button LED controller to replace a defective standard controller for
+ * non-addressable LEDs. Regular mode allows to adjust HSV color space
+ * parameters. A TCS34725 color sensor detects ambient color that is applied
+ * to the LEDs. In ambient mode the button controls only brightness.
+ */
+
+bool ambientColorEnabled = true; // start in ambient color mode
+
+int hue = 256;        // [0,359], adjusted color mode
+int sat = 66;         // [0,100], adjusted color mode
+int brightness = 152; // [0,255], globally for both modes
+
+// sensor threshold: if sum of sensor colors or clear value is below,
+// measurement is considered noise; depends on sensor integration time and
+// gain the sensor is initialized with.
+int thresh = 40;
+
+// enable LED gamma correction (from Adafruit example)
+bool useGamma = false;
+
+// pins
 const int pinButton = 8;
+const int pinRed = 9;
+const int pinGreen = 10;
+const int pinBlue = 11;
+
+// color correct sensor readings from average values sensing white
+double avgR = 0.24; // same value for all three of them disables correction
+double avgG = 0.37;
+double avgB = 0.39;
+
+// if true, the average sensor values are determined over the first n samples
+// average values of a white image (screen) should be printed and set above
+bool colorBalance = false;
+const int nSamples = 60;
+
+// TCS34725 ///////////////////////////////////////////////////////////////////
+
+#include "Adafruit_TCS34725.h"
+
+uint16_t red, green, blue, clear;
+double ambientLuminance = brightness / 255.;
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_16X);
+
+// don't change any values of globals below ///////////////////////////////////
 
 struct ColorRGB
 {
@@ -12,40 +54,34 @@ struct ColorRGB
 
 void fadeToRGB(ColorRGB c, int steps = 100, int fadeDelay = 10);
 
+byte gamma[256];
+
+double corR; // color correction will be calculated from avg color values given above
+double corG;
+double corB;
+
 // globals ////////////////////////////////////////////////////////////////////
 
-ColorRGB currentColor = {}; // interpolation color
-ColorRGB chosenColor = {};  // color set by button interaction
-ColorRGB ambientColor = {}; // color updated by color sensor
-
-int hsvIndex = 0;
-const int hsvRange[3] = {128, 64, 64};
-int hsvSpace[3] = {0, 0, 0};
-
+int adj = 0; // index for switching adjustment paramter
 bool lastButtonState = LOW;
 long int pushTime = 0;
 
-bool ambientColorEnabled = false;
-
-// TCS34725 ///////////////////////////////////////////////////////////////////
-
-#include <Wire.h>
-#include "Adafruit_TCS34725.h"
-
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
-uint16_t red, green, blue, clear;
-int maxAmbientBrightness = 127;
+ColorRGB currentColor = {};  // interpolation color
+ColorRGB adjustedColor = {}; // color set by button interaction
+ColorRGB ambientColor = {};  // color updated by color sensor
 
 // moving mean /////////////////////////////////////////////////////////////////
 
-const int windowSize = 16;
+const int windowSize = 8;
 
 struct MovingMean
 {
-    float mmValues[windowSize];
+    float mmValues[windowSize] = {};
     float mmSum = 0.;
     int mmIndex = 0;
     int mmSize = 0;
+
+    float mean = 0.;
 
     float addValue(float val)
     {
@@ -53,16 +89,23 @@ struct MovingMean
         mmValues[mmIndex] = val;
         mmIndex = (mmIndex + 1) % windowSize;
         mmSize = min(mmSize + 1, windowSize);
-        return mmSum / (float)mmSize;
+        mean = mmSum / mmSize;
+        return mean;
     }
 };
 
-MovingMean ambientRed;
+MovingMean ambientRed; // color values filtered before adding to mean
 MovingMean ambientGreen;
 MovingMean ambientBlue;
-MovingMean ambientClear;
+MovingMean luminance; // value continiously added if detected by sensor (clear > 0)
 
 // auxiliary //////////////////////////////////////////////////////////////////
+
+template <typename T>
+const T clamp(T value, T a, T b)
+{
+    return value < a ? a : (value > b ? b : value);
+}
 
 template <class T, class U>
 const T interp(const T &a, const T &b, const U &t)
@@ -82,12 +125,21 @@ const T interp(const T &a, const T &b, const U &t)
 
 void setup()
 {
+    //Serial.begin(115200);
+
     pinMode(pinRed, OUTPUT);
     pinMode(pinGreen, OUTPUT);
     pinMode(pinBlue, OUTPUT);
     pinMode(pinButton, INPUT_PULLUP);
 
     applyColorRGB({0, 0, 0});
+
+    for (int i = 0; i < 256; i++)
+    {
+        gamma[i] = pow(i / 255., 2.5) * 255;
+    }
+
+    correctColor(avgR, avgG, avgB);
 
     if (!tcs.begin())
     {
@@ -96,8 +148,30 @@ void setup()
         }
     }
 
-    // sweep to default color
-    sweepToHSV(360 + 256, 0.0, 0.1);
+    if (!ambientColorEnabled)
+    {
+        tcs.disable(); // sleep
+    }
+
+    // initialize
+    double h = hue / 360.;
+    double s = sat / 100.;
+    double v = brightness / 255.;
+    initColors(h, s, v);
+    sweepToHSV(1. + h, s, v);
+}
+
+void initColors(double h, double s, double v)
+{
+    adjustedColor = hsv1_to_rgb255(h, s, v);
+    for (int i = 0; i < windowSize; i++)
+    {
+        ambientRed.addValue(adjustedColor.r / 255.);
+        ambientGreen.addValue(adjustedColor.g / 255.);
+        ambientBlue.addValue(adjustedColor.b / 255.);
+        luminance.addValue(brightness / 255.);
+    }
+    ambientColor = adjustedColor;
 }
 
 void loop()
@@ -116,61 +190,73 @@ void buttonLoop()
     }
     else if (lastButtonState == LOW && buttonState == HIGH) // got released
     {
-        if (millis() - pushTime < 250) // short push
+        if (millis() - pushTime < 250) // released after short push
         {
             // increment index to change next hsv value
             if (!ambientColorEnabled)
             {
-                hsvIndex = (hsvIndex + 1) % 3;
+                adj = (adj + 1) % 3;
 
                 // provide user feedback
-                for (int i = 0; i < hsvIndex + 1; i++)
+                ColorRGB inv = {255 - adjustedColor.r, 255 - adjustedColor.g, 255 - adjustedColor.b};
+                for (int i = 0; i < adj + 1; i++)
                 {
-                    fadeToRGB({0, 0, 0}, 10, 5);
-                    fadeToRGB({63, 63, 63}, 10, 5);
+                    fadeToRGB(inv, 10, 8);
+                    fadeToRGB(adjustedColor, 10, 5);
                 }
-                fadeToRGB(chosenColor, 10, 5);
             }
         }
-        else if (millis() - pushTime < 1000) // long push
+        else if (millis() - pushTime < 1000) // released after long push
         {
-            // toggle ambient mode / color selection mode
+            // toggle ambient/fixed color modes
             ambientColorEnabled = !ambientColorEnabled;
 
             if (ambientColorEnabled)
             {
-                tcs.enable(); // enable sensor
+                tcs.enable();                 // enable sensor
+                ambientColor = adjustedColor; // force fade
             }
             else
             {
                 tcs.disable(); // go to sleep
-                fadeToRGB(chosenColor);
+                fadeToRGB(adjustedColor);
+                adj = 0;
             }
         }
     }
     else if (buttonState == LOW && millis() - pushTime > 1000) // press and hold
     {
-        // adjust values by sweeping through them
-        if (ambientColorEnabled) // brightness of ambient color
+        // adjust values by sweeping through their range
+        if (ambientColorEnabled || adj == 0)
         {
-            maxAmbientBrightness -= 1;
-            if (maxAmbientBrightness < 0)
+            brightness -= 1;
+            if (brightness < 0)
             {
-                maxAmbientBrightness = 255;
+                brightness = 255;
             }
         }
-        else // current selected hsv parameter
+        else if (adj == 1) // change hue
         {
-            hsvSpace[hsvIndex] -= 1;
-            if (hsvSpace[hsvIndex] < 0)
+            hue += 1;
+            if (hue > 359)
             {
-                hsvSpace[hsvIndex] = hsvRange[hsvIndex] - 1;
+                hue = 0;
             }
-            chosenColor = hsv1_to_rgb255(hsvSpace[0] / (float)(hsvRange[0] - 1),
-                                         hsvSpace[1] / (float)(hsvRange[1] - 1),
-                                         hsvSpace[2] / (float)(hsvRange[2] - 1));
-            applyColorRGB(chosenColor);
-            delay(100);
+        }
+        else if (adj == 2) // change saturation
+        {
+            sat -= 1;
+            if (sat < 0)
+            {
+                sat = 100;
+            }
+        }
+
+        if (!ambientColorEnabled) // apply
+        {
+            adjustedColor = hsv1_to_rgb255(hue / 359., sat / 100., brightness / 255.);
+            applyColorRGB(adjustedColor);
+            delay(20);
         }
     }
 
@@ -179,52 +265,129 @@ void buttonLoop()
 
 void ambientLoop()
 {
+    if (colorBalance)
+    {
+        double r, g, b;
+        collectAverageColor(r, g, b);
+        correctColor(r, g, b);
+        colorBalance = false;
+    }
+
     if (ambientColorEnabled)
     {
         tcs.getRawData(&red, &green, &blue, &clear);
 
-        float avgRed = ambientRed.addValue(red);
-        float avgGreen = ambientGreen.addValue(green);
-        float avgBlue = ambientBlue.addValue(blue);
-        float avgClear = ambientClear.addValue(clear);
+        double r, g, b;
 
-        if (avgClear > 0)
+        if (clear > 0)
         {
-            float r = avgRed / avgClear * maxAmbientBrightness;
-            float g = avgGreen / avgClear * maxAmbientBrightness;
-            float b = avgBlue / avgClear * maxAmbientBrightness;
-            ambientColor = {r, g, b};
-            applyColorRGB(ambientColor);
+            double c = clear;
+            r = red / c;
+            g = green / c;
+            b = blue / c;
+
+            if ((red ^ green ? blue : red) && (red + green + blue) > thresh)
+            {
+                r *= corR;
+                g *= corG;
+                b *= corB;
+                r = clamp(r, 0., 1.);
+                g = clamp(g, 0., 1.);
+                b = clamp(b, 0., 1.);
+
+                luminance.addValue(0.2126 * r + 0.7152 * g + 0.0722 * b);
+                ambientLuminance = luminance.mean;
+
+                r = ambientRed.addValue(r);
+                g = ambientGreen.addValue(g);
+                b = ambientBlue.addValue(b);
+            }
         }
+
+        if (clear < thresh)
+        {
+            // slowly interpolate from ambient luminance (set with last sensor detection) to user-set max brightness
+            ambientLuminance = interp(ambientLuminance, brightness / 255., 0.006);
+            ambientRed.addValue(ambientLuminance);
+            ambientGreen.addValue(ambientLuminance);
+            ambientBlue.addValue(ambientLuminance);
+        }
+
+        ColorRGB target = {ambientRed.mean * brightness, ambientGreen.mean * brightness, ambientBlue.mean * brightness};
+        ambientColor = interpColorRGB(ambientColor, target, 0.66);
+        applyColorRGB(ambientColor);
     }
 }
 
-void sweepToHSV(int hue, double sat, double val)
+void collectAverageColor(double &r, double &g, double &b)
 {
-    double h, s, v;
-    for (int i = 0; i <= hue; i++)
+    r = 0.;
+    g = 0.;
+    b = 0.;
+
+    for (int i = 0; i < nSamples; i++)
     {
-        h = (i % 360) / 360.;
-        double t = i / (double)hue;
-        s = interp(1., sat, t);
-        v = interp(1., val, t);
-        chosenColor = hsv1_to_rgb255(h, s, v);
-        applyColorRGB(chosenColor);
-        delay(interp(12, 4, t * t));
+        tcs.getRawData(&red, &green, &blue, &clear);
+
+        if (clear > 0)
+        {
+            double c = clear;
+            r += red / c;
+            g += green / c;
+            b += blue / c;
+        }
     }
 
-    hsvSpace[0] = h * (hsvRange[0] - 1);
-    hsvSpace[1] = s * (hsvRange[1] - 1);
-    hsvSpace[2] = v * (hsvRange[2] - 1);
+    r /= (double)nSamples;
+    g /= (double)nSamples;
+    b /= (double)nSamples;
+
+    /*Serial.print(r);
+    Serial.print("\t");
+    Serial.print(g);
+    Serial.print("\t");
+    Serial.print(b);
+    Serial.print("\t");*/
+}
+
+void correctColor(double r, double g, double b)
+{
+    double sum = (r + g + b);
+    corR = sum / (3. * r);
+    corG = sum / (3. * g);
+    corB = sum / (3. * b);
+}
+
+void sweepToHSV(double h1, double s1, double v1)
+{
+    double h, s, v, t;
+    for (int i = 0; i <= h1 * 360; i++)
+    {
+        t = i / (h1 * 360.);
+        h = (i % 360) / 360.; // hue in range [0,1)
+        s = interp(1., s1, t);
+        v = interp(1., v1, t);
+        applyColorRGB(hsv1_to_rgb255(h, s, v));
+        delay(interp(4, 32, t * t));
+    }
 }
 
 // RGB color space functions //////////////////////////////////////////////////
 
 void setColorRGB(ColorRGB c)
 {
-    analogWrite(pinRed, c.r);
-    analogWrite(pinGreen, c.g);
-    analogWrite(pinBlue, c.b);
+    if (useGamma)
+    {
+        analogWrite(pinRed, gamma[(int)c.r]);
+        analogWrite(pinGreen, gamma[(int)c.g]);
+        analogWrite(pinBlue, gamma[(int)c.b]);
+    }
+    else
+    {
+        analogWrite(pinRed, c.r);
+        analogWrite(pinGreen, c.g);
+        analogWrite(pinBlue, c.b);
+    }
 }
 
 void applyColorRGB(ColorRGB c)
