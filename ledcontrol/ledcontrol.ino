@@ -11,6 +11,9 @@ int hue = 256;        // [0,359], adjusted color mode
 int sat = 66;         // [0,100], adjusted color mode
 int brightness = 152; // [0,255], globally for both modes
 
+ // duration of sweep through the full value range when adjusting color
+double sweepSeconds = 9.;
+
 // sensor threshold: if sum of sensor colors or clear value is below,
 // measurement is considered noise; depends on sensor integration time and
 // gain the sensor is initialized with.
@@ -226,9 +229,12 @@ void buttonLoop()
     }
     else if (buttonState == LOW && millis() - pushTime > 1000) // press and hold
     {
+        int range = 100;
+
         // adjust values by sweeping through their range
         if (ambientColorEnabled || adj == 0)
         {
+            range = 255;
             brightness -= 1;
             if (brightness < 0)
             {
@@ -237,6 +243,7 @@ void buttonLoop()
         }
         else if (adj == 1) // change hue
         {
+            range = 359;
             hue += 1;
             if (hue > 359)
             {
@@ -245,6 +252,7 @@ void buttonLoop()
         }
         else if (adj == 2) // change saturation
         {
+            range = 100;
             sat -= 1;
             if (sat < 0)
             {
@@ -252,11 +260,11 @@ void buttonLoop()
             }
         }
 
-        if (!ambientColorEnabled) // apply
+        if (!ambientColorEnabled) // apply only in color mode; ambient mode is updated in loop
         {
             adjustedColor = hsv1_to_rgb255(hue / 359., sat / 100., brightness / 255.);
             applyColorRGB(adjustedColor);
-            delay(20);
+            delay(1000. / (range / sweepSeconds));
         }
     }
 
