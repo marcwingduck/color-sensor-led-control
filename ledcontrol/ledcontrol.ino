@@ -1,8 +1,20 @@
 /**
- * Single button LED controller to replace a defective standard controller for
- * non-addressable LEDs. Regular mode allows to adjust HSV color space
- * parameters. A TCS34725 color sensor detects ambient color that is applied
- * to the LEDs. In ambient mode the button controls only brightness.
+ * LED controller to replace a defective standard controller for
+ * non-addressable LEDs.
+ * 
+ * In default mode, a TCS34725 color sensor detects ambient color that is
+ * applied to the LEDs after some averaging.
+ * Holding the button longer than one second starts sweeping through the
+ * brightness.
+ * Static color mode is swichted to by holding the button for 0.5..1.0 seconds.
+ * In this mode a short push (less than 0.5 seconds) changes the parameter
+ * adjusted by sweep mode. Parameters are HSV color space in the following
+ * order: brightness, hue, saturation. The LEDs blink one, two or three
+ * times to let you know what parameter will be adjusted.
+ * 
+ * Recently a switch was added to the circuit in order to be able to
+ * switch between the two LED stripes that are attached in my setup
+ * but at the moment it only controls the LED of the TCS34725.
  */
 
 bool ambientColorEnabled = true; // start in ambient color mode
@@ -58,19 +70,34 @@ double corR = 1.; // color correction will be calculated from avg color values g
 double corG = 1.;
 double corB = 1.;
 
-// globals ////////////////////////////////////////////////////////////////////
+// inputs /////////////////////////////////////////////////////////////////////
 
-int adj = 0; // index for switching adjustment paramter
-bool lastButtonState = HIGH;
-bool lastReadingState = HIGH;
-unsigned long pushTime = 0;
-unsigned long lastDebounceTime = 0;
+enum InputType
+{
+    BUTTON = 0,
+    SWITCH_LEFT,
+    SWITCH_RIGHT,
+    N_INPUTS
+};
+
+int inputPin[N_INPUTS];
+bool reading[N_INPUTS];
+bool lastReading[N_INPUTS];
+bool inputState[N_INPUTS];
+bool lastInputState[N_INPUTS];
+unsigned long lastDebounceTime[N_INPUTS];
+
 unsigned long debounceDelay = 50;
+
+unsigned long pushTime = 0; // button push time
+
+// globals ////////////////////////////////////////////////////////////////////
 
 ColorRGB currentColor = {};  // interpolation color
 ColorRGB adjustedColor = {}; // color set by button interaction
 ColorRGB ambientColor = {};  // color updated by color sensor
 
+int adjustIndex = 0;   // index for switching adjustment parameter
 uint16_t maxClear = 1; // max clear value to determine brightness range
 unsigned long dynTime = 0;
 
@@ -130,6 +157,18 @@ const T interp(const T &a, const T &b, const U &t)
 
 void setup()
 {
+    for (int i = 0; i < N_INPUTS; i++)
+    {
+        lastReading[i] = HIGH;
+        inputState[i] = HIGH;
+        lastInputState[i] = HIGH;
+        lastDebounceTime[i] = 0;
+    }
+
+    inputPin[BUTTON] = pinButton;
+    inputPin[SWITCH_LEFT] = pinSwitchL;
+    inputPin[SWITCH_RIGHT] = pinSwitchR;
+
     pinMode(pinSensorLight, OUTPUT);
     digitalWrite(pinSensorLight, LOW); // turn off sensor LED
 
@@ -180,109 +219,140 @@ void setup()
 
 void loop()
 {
-    inputLoop();
+    switchLoop();
+    buttonLoop();
     ambientLoop();
 }
 
-void inputLoop()
+bool debounceInput(InputType input)
 {
-    bool reading = digitalRead(pinButton);
+    bool changed = false;
 
-    if (reading != lastReadingState)
+    reading[input] = digitalRead(inputPin[input]);
+
+    if (reading[input] != lastReading[input])
     {
-        lastDebounceTime = millis();
+        lastDebounceTime[input] = millis();
     }
 
-    if ((millis() - lastDebounceTime) > debounceDelay)
+    if ((millis() - lastDebounceTime[input]) > debounceDelay)
     {
-        bool buttonState = reading;
-
-        if (lastButtonState == HIGH && buttonState == LOW) // got pushed
+        if (reading[input] != inputState[input])
         {
-            pushTime = millis();
+            inputState[input] = reading[input];
+            changed = true;
         }
-        else if (lastButtonState == LOW && buttonState == HIGH) // got released
-        {
-            if (millis() - pushTime < 250) // released after short push
-            {
-                // increment index to change next hsv value
-                if (!ambientColorEnabled)
-                {
-                    adj = (adj + 1) % 3;
-
-                    // provide user feedback
-                    ColorRGB inv = {255 - adjustedColor.r, 255 - adjustedColor.g, 255 - adjustedColor.b};
-                    for (int i = 0; i < adj + 1; i++)
-                    {
-                        fadeToRGB(inv, 10, 8);
-                        fadeToRGB(adjustedColor, 10, 5);
-                    }
-                }
-            }
-            else if (millis() - pushTime < 1000) // released after long push
-            {
-                // toggle ambient/fixed color modes
-                ambientColorEnabled = !ambientColorEnabled;
-
-                if (ambientColorEnabled)
-                {
-                    tcsEnable();
-                    ambientColor = adjustedColor; // force fade
-                }
-                else
-                {
-                    tcsDisable();
-                    fadeToRGB(adjustedColor);
-                    adj = 0;
-                }
-            }
-        }
-        else if (buttonState == LOW && millis() - pushTime > 1000) // press and hold
-        {
-            int range = 100;
-
-            // adjust values by sweeping through their range
-            if (ambientColorEnabled || adj == 0) // change brightness
-            {
-                range = 255;
-                brightness -= 1;
-                if (brightness < 0)
-                {
-                    brightness = 255;
-                }
-            }
-            else if (adj == 1) // change hue
-            {
-                range = 359;
-                hue += 1;
-                if (hue > 359)
-                {
-                    hue = 0;
-                }
-            }
-            else if (adj == 2) // change saturation
-            {
-                range = 100;
-                sat -= 1;
-                if (sat < 0)
-                {
-                    sat = 100;
-                }
-            }
-
-            if (!ambientColorEnabled) // apply only in color mode; ambient mode is updated in loop
-            {
-                adjustedColor = hsv1_to_rgb255(hue / 359., sat / 100., brightness / 255.);
-                applyColorRGB(adjustedColor);
-            }
-
-            delay(1000. / (range / sweepSeconds));
-        }
-
-        lastButtonState = buttonState;
     }
 
-    lastReadingState = reading;
+    lastReading[input] = reading[input];
+
+    return changed;
+}
+
+void switchLoop()
+{
+    if (debounceInput(SWITCH_LEFT))
+    {
+        digitalWrite(pinSensorLight, !inputState[SWITCH_LEFT]);
+    }
+
+    if (debounceInput(SWITCH_RIGHT))
+    {
+        digitalWrite(pinSensorLight, !inputState[SWITCH_RIGHT]);
+    }
+}
+
+void buttonLoop()
+{
+    bool changed = debounceInput(BUTTON);
+
+    if (inputState[BUTTON] == LOW && millis() - pushTime > 1000) // press and hold
+    {
+        int range = 100;
+
+        // adjust values by sweeping through their range
+        if (ambientColorEnabled || adjustIndex == 0) // change brightness
+        {
+            range = 255;
+            brightness -= 1;
+            if (brightness < 0)
+            {
+                brightness = 255;
+            }
+        }
+        else if (adjustIndex == 1) // change hue
+        {
+            range = 359;
+            hue += 1;
+            if (hue > 359)
+            {
+                hue = 0;
+            }
+        }
+        else if (adjustIndex == 2) // change saturation
+        {
+            range = 100;
+            sat -= 1;
+            if (sat < 0)
+            {
+                sat = 100;
+            }
+        }
+
+        if (!ambientColorEnabled) // apply only in color mode; ambient mode is updated in loop
+        {
+            adjustedColor = hsv1_to_rgb255(hue / 359., sat / 100., brightness / 255.);
+            applyColorRGB(adjustedColor);
+        }
+
+        delay(1000. / (range / sweepSeconds));
+    }
+
+    if (!changed)
+    {
+        return; // nothing changed
+    }
+
+    if (inputState[BUTTON] == LOW) // got pushed
+    {
+        pushTime = millis();
+    }
+    else // got released
+    {
+        if (millis() - pushTime < 300) // released after short push
+        {
+            // increment index to change next hsv value
+            if (!ambientColorEnabled)
+            {
+                adjustIndex = (adjustIndex + 1) % 3;
+
+                // provide user feedback
+                ColorRGB inv = {255 - adjustedColor.r, 255 - adjustedColor.g, 255 - adjustedColor.b};
+                for (int i = 0; i < adjustIndex + 1; i++)
+                {
+                    fadeToRGB(inv, 10, 8);
+                    fadeToRGB(adjustedColor, 10, 5);
+                }
+            }
+        }
+        else if (millis() - pushTime < 1000) // released after long push
+        {
+            // toggle ambient/fixed color modes
+            ambientColorEnabled = !ambientColorEnabled;
+
+            if (ambientColorEnabled)
+            {
+                tcsEnable();
+                ambientColor = adjustedColor; // force fade
+            }
+            else
+            {
+                tcsDisable();
+                fadeToRGB(adjustedColor);
+                adjustIndex = 0;
+            }
+        }
+    }
 }
 
 void ambientLoop()
