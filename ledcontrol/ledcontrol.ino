@@ -1,30 +1,32 @@
 /**
  * LED controller to replace a defective standard controller for
  * non-addressable LEDs.
- * 
- * In default mode, a TCS34725 color sensor detects ambient color that is
- * applied to the LEDs after some averaging.
- * Holding the button longer than one second starts sweeping through the
- * brightness.
- * Static color mode is swichted to by holding the button for 0.5..1.0 seconds.
- * In this mode a short push (less than 0.5 seconds) changes the parameter
- * adjusted by sweep mode. Parameters are HSV color space in the following
- * order: brightness, hue, saturation. The LEDs blink one, two or three
- * times to let you know what parameter will be adjusted.
- * 
- * Recently a switch was added to the circuit in order to be able to
- * switch between the two LED stripes that are attached in my setup
- * but at the moment it only controls the LED of the TCS34725.
+ * A TCS34725 color sensor detects ambient color that is applied to the LEDs
+ * after some averaging. Holding the button longer than one second starts
+ * sweeping through the brightness.
+ * Static color mode is default. Ambient lighting mode is switched to by holding
+ * the button for 0.5..1.0 seconds. In this mode a short push (less than 0.5
+ * seconds) changes the parameter adjusted by sweep mode. Parameters are HSV
+ * color space in the following order: brightness, hue, saturation.
+ * The LEDs blink once, twice or thrice to let you know which parameter will be
+ * adjusted. An additional switch controls the LED of the TCS34725.
  */
 
-bool ambientColorEnabled = true; // start in ambient color mode
+enum Mode
+{
+    STATIC = 0,
+    AMBIENT,
+    N_MODES
+};
 
-int hue = 256;        // [0,359], adjusted color mode
-int sat = 66;         // [0,100], adjusted color mode
-int brightness = 192; // [0,255], globally for both modes
+Mode mode = STATIC;  // initialize in static color mode
+
+int hue = 256;         // [0,359], static color mode
+int sat = 66;          // [0,100], static color mode
+int brightness = 192;  // [0,255], global for both modes
 
 // duration of sweep through the full value range when adjusting color
-double sweepSeconds = 9.;
+const double sweepSeconds = 16.;
 
 // pins
 const int pinInterrupt = 2;
@@ -36,17 +38,17 @@ const int pinBlue = 11;
 const int pinSwitchL = 12;
 const int pinSwitchR = 13;
 
-// color correct sensor readings from average values sensing white
-double avgR = 0.24; // same value for all three of them disables correction
+// color correct sensor readings from average values sensing white, same value for all three of them disables correction
+double avgR = 0.24;
 double avgG = 0.37;
 double avgB = 0.39;
 
 // values of rgb strip to display white light
-double whiteR = 1; //1.00;
-double whiteG = 1; //0.64;
-double whiteB = 1; //0.87;
+double whiteR = 1.;  // 1.00;
+double whiteG = 1.;  // 0.64;
+double whiteB = 1.;  // 0.87;
 
-// TCS34725 ///////////////////////////////////////////////////////////////////
+// TCS34725 ////////////////////////////////////////////////////////////////////
 
 #include <Adafruit_TCS34725.h>
 
@@ -55,7 +57,7 @@ double ambientLuminance = brightness / 255.;
 Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_16X);
 volatile boolean colorRead = false;
 
-// don't change any values of globals below ///////////////////////////////////
+// don't change any values of globals below ////////////////////////////////////
 
 struct ColorRGB
 {
@@ -66,11 +68,12 @@ struct ColorRGB
 
 void fadeToRGB(ColorRGB c, int steps = 100, int fadeDelay = 10, bool quadratic = false);
 
-double corR = 1.; // color correction will be calculated from avg color values given above
+// color correction will be calculated from avg color values given above
+double corR = 1.;
 double corG = 1.;
 double corB = 1.;
 
-// inputs /////////////////////////////////////////////////////////////////////
+// inputs //////////////////////////////////////////////////////////////////////
 
 enum InputType
 {
@@ -89,55 +92,56 @@ unsigned long lastDebounceTime[N_INPUTS];
 
 unsigned long debounceDelay = 50;
 
-unsigned long pushTime = 0; // button push time
+unsigned long pushTime = 0;  // button push time
 
-// globals ////////////////////////////////////////////////////////////////////
+// globals /////////////////////////////////////////////////////////////////////
 
-ColorRGB currentColor = {};  // interpolation color
-ColorRGB adjustedColor = {}; // color set by button interaction
-ColorRGB ambientColor = {};  // color updated by color sensor
+ColorRGB currentColor = {};   // interpolation color
+ColorRGB adjustedColor = {};  // color set by button interaction
+ColorRGB ambientColor = {};   // color updated by color sensor
 
-int adjustIndex = 0;   // index for switching adjustment parameter
-uint16_t maxClear = 1; // max clear value to determine brightness range
+int adjustIndex = 0;    // index for switching adjustment parameter
+uint16_t maxClear = 1;  // max clear value to determine brightness range
 unsigned long dynTime = 0;
 
-// moving mean /////////////////////////////////////////////////////////////////
+// filter //////////////////////////////////////////////////////////////////////
 
-const int windowSize = 4;
-
-struct MovingMean
+struct LowPassFilter
 {
-    double mmValues[windowSize] = {};
-    double mmSum = 0.;
-    int mmIndex = 0;
-    int mmSize = 0;
+    double a = 0.4;
+    double y0 = 0.;
 
-    double mean = 0.;
-
-    double addValue(double val)
+    double update(double x1)
     {
-        mmSum = mmSum - mmValues[mmIndex] + val;
-        mmValues[mmIndex] = val;
-        mmIndex = (mmIndex + 1) % windowSize;
-        mmSize = min(mmSize + 1, windowSize);
-        mean = mmSum / mmSize;
-        return mean;
+        y0 = a * x1 + (1.0 - a) * y0;
+        return y0;
     }
 };
 
-MovingMean ambientRed; // filter rgbc values
-MovingMean ambientGreen;
-MovingMean ambientBlue;
-MovingMean ambientClear;
-MovingMean luminance; // mean luminance
+// filtered rgbc/luminance values
+LowPassFilter ambientRed;
+LowPassFilter ambientGreen;
+LowPassFilter ambientBlue;
+LowPassFilter ambientClear;
+LowPassFilter luminance;
 
-// auxiliary //////////////////////////////////////////////////////////////////
+// auxiliary ///////////////////////////////////////////////////////////////////
+
+// template definition required by vscode/platform.io, but results in
+// compilation error with Arduino IDE
+template <typename T>
+const T clamp(const T &x, const T &a, const T &b);
 
 template <typename T>
-const T clamp(T value, T a, T b)
+const T clamp(const T &x, const T &a, const T &b)
 {
-    return value < a ? a : (value > b ? b : value);
+    return x < a ? a : (x > b ? b : x);
 }
+
+// template definition required by vscode/platform.io, but results in
+// compilation error with Arduino IDE
+template <class T, class U>
+const T interp(const T &a, const T &b, const U &t);
 
 template <class T, class U>
 const T interp(const T &a, const T &b, const U &t)
@@ -153,7 +157,7 @@ const T interp(const T &a, const T &b, const U &t)
     return (T)(a + t * (b - a));
 }
 
-// main ///////////////////////////////////////////////////////////////////////
+// main ////////////////////////////////////////////////////////////////////////
 
 void setup()
 {
@@ -170,17 +174,17 @@ void setup()
     inputPin[SWITCH_RIGHT] = pinSwitchR;
 
     pinMode(pinSensorLight, OUTPUT);
-    digitalWrite(pinSensorLight, LOW); // turn off sensor LED
+    digitalWrite(pinSensorLight, LOW);  // turn off sensor LED
 
     pinMode(pinRed, OUTPUT);
     pinMode(pinGreen, OUTPUT);
     pinMode(pinBlue, OUTPUT);
 
-    pinMode(pinButton, INPUT_PULLUP);
+    pinMode(pinButton, INPUT_PULLUP);  // active low
     pinMode(pinSwitchL, INPUT_PULLUP);
     pinMode(pinSwitchR, INPUT_PULLUP);
 
-    pinMode(pinInterrupt, INPUT_PULLUP); // active-low/open-drain
+    pinMode(pinInterrupt, INPUT_PULLUP);  // active-low/open-drain
     attachInterrupt(digitalPinToInterrupt(pinInterrupt), isr, FALLING);
 
     applyColorRGB({0, 0, 0});
@@ -192,15 +196,19 @@ void setup()
         }
     }
 
-    // adjusted color mode if button is held on startup
+    // switch color mode if button is held during startup
     if (digitalRead(pinButton) == LOW)
     {
-        ambientColorEnabled = false;
-        tcsDisable();
+        mode = (Mode)((mode + 1) % N_MODES);
+    }
+
+    if (mode == AMBIENT)
+    {
+        tcsEnable();
     }
     else
     {
-        tcsEnable();
+        tcsDisable();
     }
 
     // calculate color correction
@@ -214,7 +222,7 @@ void setup()
 
     // start animation
     fluorescentFlicker();
-    //sweepToHSV(1. + h, s, v);
+    // sweepToHSV(1. + h, s, v);
 }
 
 void loop()
@@ -266,12 +274,13 @@ void buttonLoop()
 {
     bool changed = debounceInput(BUTTON);
 
-    if (inputState[BUTTON] == LOW && millis() - pushTime > 1000) // press and hold
+    // button is pushed down, thus no change event
+    if (inputState[BUTTON] == LOW && millis() - pushTime > 1000)  // press and hold
     {
         int range = 100;
 
         // adjust values by sweeping through their range
-        if (ambientColorEnabled || adjustIndex == 0) // change brightness
+        if (mode == AMBIENT || adjustIndex == 0)  // change brightness
         {
             range = 255;
             brightness -= 1;
@@ -280,7 +289,7 @@ void buttonLoop()
                 brightness = 255;
             }
         }
-        else if (adjustIndex == 1) // change hue
+        else if (adjustIndex == 1)  // change hue
         {
             range = 359;
             hue += 1;
@@ -289,7 +298,7 @@ void buttonLoop()
                 hue = 0;
             }
         }
-        else if (adjustIndex == 2) // change saturation
+        else if (adjustIndex == 2)  // change saturation
         {
             range = 100;
             sat -= 1;
@@ -299,9 +308,10 @@ void buttonLoop()
             }
         }
 
-        if (!ambientColorEnabled) // apply only in color mode; ambient mode is updated in loop
+        adjustedColor = hsv1_to_rgb255(hue / 359., sat / 100., brightness / 255.);
+
+        if (mode == STATIC)  // apply only in static color mode; ambient mode is updated in ambient loop
         {
-            adjustedColor = hsv1_to_rgb255(hue / 359., sat / 100., brightness / 255.);
             applyColorRGB(adjustedColor);
         }
 
@@ -310,19 +320,19 @@ void buttonLoop()
 
     if (!changed)
     {
-        return; // nothing changed
+        return;  // nothing changed (literally)
     }
 
-    if (inputState[BUTTON] == LOW) // got pushed
+    if (inputState[BUTTON] == LOW)  // got pushed
     {
         pushTime = millis();
     }
-    else // got released
+    else  // got released
     {
-        if (millis() - pushTime < 300) // released after short push
+        if (millis() - pushTime < 300)  // released after short push
         {
             // increment index to change next hsv value
-            if (!ambientColorEnabled)
+            if (mode == STATIC)
             {
                 adjustIndex = (adjustIndex + 1) % 3;
 
@@ -335,21 +345,21 @@ void buttonLoop()
                 }
             }
         }
-        else if (millis() - pushTime < 1000) // released after long push
+        else if (millis() - pushTime < 1000)  // released after long push
         {
             // toggle ambient/fixed color modes
-            ambientColorEnabled = !ambientColorEnabled;
+            mode = (Mode)((mode + 1) % N_MODES);
 
-            if (ambientColorEnabled)
+            if (mode == AMBIENT)
             {
                 tcsEnable();
-                ambientColor = adjustedColor; // force fade
+                ambientColor = adjustedColor;  // force fade
             }
             else
             {
                 tcsDisable();
-                fadeToRGB(adjustedColor);
-                adjustIndex = 0;
+                fadeToRGB(adjustedColor);  // fade from ambient to static color
+                adjustIndex = 0;           // reset adjust index
             }
         }
     }
@@ -357,27 +367,31 @@ void buttonLoop()
 
 void ambientLoop()
 {
-    bool newReading = false;
-
-    if (colorRead)
-    {
-        tcsGetRawDataNoDelay(&red, &green, &blue, &clear);
-        newReading = true;
-        tcs.clearInterrupt();
-        colorRead = false;
-    }
-
-    if (!ambientColorEnabled)
+    if (mode != AMBIENT)
     {
         return;
     }
 
-    // prevent single color channel display in low light
+    bool newReading = false;
+
+    // handle interrupt
+    if (colorRead)  // set true by interrupt
+    {
+        // get colors
+        tcsGetRawDataNoDelay(&red, &green, &blue, &clear);
+        newReading = true;
+
+        // clear and reset
+        tcs.clearInterrupt();
+        colorRead = false;
+    }
+
     if (newReading)
     {
+        // prevent displaying a single primary color in low light settings
         if (clear > 0 && red > 1 && green > 1 && blue > 1)
         {
-            if (clear > maxClear) // keep track of max value for normalization
+            if (clear > maxClear)  // keep track of max value for normalization
             {
                 maxClear = clear;
             }
@@ -387,42 +401,39 @@ void ambientLoop()
             double b = (double)blue / clear;
             double c = (double)clear / maxClear;
 
-            r *= corR;
-            g *= corG;
-            b *= corB;
+            r = clamp(r * corR, 0., 1.);
+            g = clamp(g * corG, 0., 1.);
+            b = clamp(b * corB, 0., 1.);
 
-            r = clamp(r, 0., 1.);
-            g = clamp(g, 0., 1.);
-            b = clamp(b, 0., 1.);
+            luminance.update(0.2126 * r + 0.7152 * g + 0.0722 * b);
+            ambientLuminance = luminance.y0;
 
-            luminance.addValue(0.2126 * r + 0.7152 * g + 0.0722 * b);
-            ambientLuminance = luminance.mean;
-
-            ambientRed.addValue(r);
-            ambientGreen.addValue(g);
-            ambientBlue.addValue(b);
-            ambientClear.addValue(c);
+            ambientRed.update(r);
+            ambientGreen.update(g);
+            ambientBlue.update(b);
+            ambientClear.update(c);
         }
         else
         {
             // slowly interpolate from ambient luminance (set with last sensor detection above) to user-set brightness
             ambientLuminance = interp(ambientLuminance, brightness / 255., 0.001);
-            ambientRed.addValue(ambientLuminance);
-            ambientGreen.addValue(ambientLuminance);
-            ambientBlue.addValue(ambientLuminance);
+            ambientRed.update(ambientLuminance);
+            ambientGreen.update(ambientLuminance);
+            ambientBlue.update(ambientLuminance);
+            // ambientClear.update(ambientLuminance);  // not sure if necessary
         }
     }
 
     // decrement max clear in order to keep detected brightness dynamic
     if (clear < maxClear && (millis() - dynTime) > 2000)
     {
-        maxClear = max(maxClear - 1, 1);
+        maxClear = max(maxClear - 1, 1);  // prevent division by zero
         dynTime = millis();
     }
 
     // calculate dynamic brightness factor
-    double dyn = interp(0.13, brightness / 255., ambientClear.mean);
-    ColorRGB target = {ambientRed.mean * dyn * 255, ambientGreen.mean * dyn * 255, ambientBlue.mean * dyn * 255};
+    double dyn = interp(0.13, brightness / 255., ambientClear.y0);
+    ColorRGB target = {ambientRed.y0 * dyn * 255, ambientGreen.y0 * dyn * 255, ambientBlue.y0 * dyn * 255};
     ambientColor = interpColorRGB(ambientColor, target, 0.88);
     applyColorRGB(ambientColor);
 }
@@ -431,11 +442,10 @@ void ambientLoop()
 
 void tcsEnable()
 {
-    colorRead = false;
-    tcs.enable(); // enable sensor
+    colorRead = false;  // reset
+    tcs.enable();       // enable sensor
 
-    // set persistence filter to generate an interrupt for every rgb cycle,
-    // regardless of the integration limits
+    // set persistence filter to generate an interrupt for every rgb cycle, regardless of the integration limits
     tcs.write8(TCS34725_PERS, TCS34725_PERS_NONE);
     tcs.setInterrupt(true);
 }
@@ -444,10 +454,11 @@ void tcsDisable()
 {
     tcs.setInterrupt(false);
     tcs.clearInterrupt();
+    tcs.disable();  // go to sleep
     colorRead = false;
-    tcs.disable(); // go to sleep
 }
 
+// Interrupt Service Routine
 void isr()
 {
     colorRead = true;
@@ -455,13 +466,13 @@ void isr()
 
 void tcsGetRawDataNoDelay(uint16_t *r, uint16_t *g, uint16_t *b, uint16_t *c)
 {
-    *c = tcs.read16(TCS34725_CDATAL);
     *r = tcs.read16(TCS34725_RDATAL);
     *g = tcs.read16(TCS34725_GDATAL);
     *b = tcs.read16(TCS34725_BDATAL);
+    *c = tcs.read16(TCS34725_CDATAL);
 }
 
-// init ///////////////////////////////////////////////////////////////////////
+// init ////////////////////////////////////////////////////////////////////////
 
 void correctColor(double r, double g, double b)
 {
@@ -474,17 +485,14 @@ void correctColor(double r, double g, double b)
 void initColors(double h, double s, double v)
 {
     adjustedColor = hsv1_to_rgb255(h, s, v);
-    for (int i = 0; i < windowSize; i++)
-    {
-        ambientRed.addValue(adjustedColor.r / 255.);
-        ambientGreen.addValue(adjustedColor.g / 255.);
-        ambientBlue.addValue(adjustedColor.b / 255.);
-        luminance.addValue(brightness / 255.);
-    }
+    ambientRed.y0 = adjustedColor.r / 255.;
+    ambientGreen.y0 = adjustedColor.g / 255.;
+    ambientBlue.y0 = adjustedColor.b / 255.;
+    luminance.y0 = brightness / 255.;
     ambientColor = adjustedColor;
 }
 
-// animations /////////////////////////////////////////////////////////////////
+// animations //////////////////////////////////////////////////////////////////
 
 void fluorescentFlicker()
 {
@@ -495,7 +503,7 @@ void fluorescentFlicker()
     fadeToRGB({0, 0, 0}, 10, 2, true);
     delay(300);
     fadeToRGB(adjustedColor, 100, 3);
-    delay(3000);
+    delay(1000);
 }
 
 void sweepToHSV(double h1, double s1, double v1)
@@ -504,7 +512,7 @@ void sweepToHSV(double h1, double s1, double v1)
     for (int i = 0; i <= h1 * 360; i++)
     {
         t = i / (h1 * 360.);
-        h = (i % 360) / 360.; // hue in range [0,1)
+        h = (i % 360) / 360.;  // hue in range [0,1)
         s = interp(1., s1, t);
         v = interp(1., v1, t);
         applyColorRGB(hsv1_to_rgb255(h, s, v));
@@ -512,21 +520,13 @@ void sweepToHSV(double h1, double s1, double v1)
     }
 }
 
-// light strip ////////////////////////////////////////////////////////////////
+// light strip /////////////////////////////////////////////////////////////////
 
 void setColorRGB(ColorRGB c)
 {
-    byte r = c.r;
-    byte g = c.g;
-    byte b = c.b;
-
-    r *= whiteR;
-    g *= whiteG;
-    b *= whiteB;
-
-    analogWrite(pinRed, r);
-    analogWrite(pinGreen, g);
-    analogWrite(pinBlue, b);
+    analogWrite(pinRed, c.r * whiteR);
+    analogWrite(pinGreen, c.g * whiteG);
+    analogWrite(pinBlue, c.b * whiteB);
 }
 
 void applyColorRGB(ColorRGB c)
@@ -535,9 +535,9 @@ void applyColorRGB(ColorRGB c)
     setColorRGB(c);
 }
 
-void fadeToRGB(ColorRGB c, int steps = 100, int fadeDelay = 10, bool quadratic = false)
+void fadeToRGB(ColorRGB c, int steps, int fadeDelay, bool quadratic)
 {
-    double t = 0.0f;
+    double t;
     for (int i = 0; i < steps; i++)
     {
         t = (i + 1) / (double)steps;
@@ -558,7 +558,7 @@ ColorRGB interpColorRGB(const ColorRGB &c1, const ColorRGB &c2, double t)
     return {r, g, b};
 }
 
-// HSV color space functions //////////////////////////////////////////////////
+// HSV color space functions ///////////////////////////////////////////////////
 
 static void hsv2rgb(double h, double s, double v, double &r, double &g, double &b)
 {
@@ -570,29 +570,29 @@ static void hsv2rgb(double h, double s, double v, double &r, double &g, double &
 
     switch (i % 6)
     {
-    case 0:
-        r = v, g = t, b = p;
-        break;
-    case 1:
-        r = q, g = v, b = p;
-        break;
-    case 2:
-        r = p, g = v, b = t;
-        break;
-    case 3:
-        r = p, g = q, b = v;
-        break;
-    case 4:
-        r = t, g = p, b = v;
-        break;
-    case 5:
-        r = v, g = p, b = q;
-        break;
+        case 0:
+            r = v, g = t, b = p;
+            break;
+        case 1:
+            r = q, g = v, b = p;
+            break;
+        case 2:
+            r = p, g = v, b = t;
+            break;
+        case 3:
+            r = p, g = q, b = v;
+            break;
+        case 4:
+            r = t, g = p, b = v;
+            break;
+        case 5:
+            r = v, g = p, b = q;
+            break;
     }
 
-    r = r < 0. ? 0. : (r > 1. ? 1. : r);
-    g = g < 0. ? 0. : (g > 1. ? 1. : g);
-    b = b < 0. ? 0. : (b > 1. ? 1. : b);
+    r = clamp(r, 0., 1.);
+    g = clamp(g, 0., 1.);
+    b = clamp(b, 0., 1.);
 }
 
 static void rgb2hsv(double r, double g, double b, double &h, double &s, double &v)
@@ -630,7 +630,7 @@ static void rgb2hsv(double r, double g, double b, double &h, double &s, double &
         h += 360.;
     }
 
-    if (maxVal < epsilon) // = 0
+    if (maxVal < epsilon)  // = 0
     {
         s = 0.;
     }
@@ -643,12 +643,12 @@ static void rgb2hsv(double r, double g, double b, double &h, double &s, double &
 
     h /= 360.;
 
-    h = h < 0. ? 0. : (h > 1. ? 1. : h);
-    s = s < 0. ? 0. : (s > 1. ? 1. : s);
-    v = v < 0. ? 0. : (v > 1. ? 1. : v);
+    h = clamp(h, 0., 1.);
+    s = clamp(s, 0., 1.);
+    v = clamp(v, 0., 1.);
 }
 
-// color space helper /////////////////////////////////////////////////////////
+// color space helper //////////////////////////////////////////////////////////
 
 static ColorRGB hsv1_to_rgb255(double h, double s, double v)
 {
